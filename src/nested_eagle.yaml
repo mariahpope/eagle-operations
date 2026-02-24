@@ -1,0 +1,222 @@
+app:
+  # Application values likely to require configuration by users.
+  base: /path/to/EAGLE/update
+  gpu:
+    batchargs: &gpu-batchargs
+      --gres: 'gpu:h100:1' # NB: Brittle, tied both to Slurm and to Ursa.
+      nodes: 1
+      partition: '{{ app.gpu.partition }}'
+      queue: gpuwf # NB: Brittle, tied to Ursa.
+    partition: u1-h100
+  leadtime: 48
+  partitions:
+    netaccess: u1-service
+  platform: &platform
+    account: epic
+    scheduler: slurm
+  rundir: '{{ app.base }}/run'
+  time:
+    start: !datetime '{{
+      (
+        now.replace(
+          hour=(now.hour // 6) * 6,
+          minute=0,
+          second=0,
+          microsecond=0
+        ) - timedelta(hours=12)
+      ).strftime("%Y-%m-%dT%H")
+    }}'
+    step: !timedelta 6
+    stop: !datetime '{{
+      (
+        (
+          now.replace(
+            hour=(now.hour // 6) * 6,
+            minute=0,
+            second=0,
+            microsecond=0
+          ) - timedelta(hours=6)
+        ) + timedelta(hours=app.lead_time)
+      ).strftime("%Y-%m-%dT%H")
+    }}'
+grids_and_meshes:
+  # Config for the GridsAndMeshes driver.
+  filenames:
+    combined_grids: '{{ val.filenames.combined_grids }}'
+    gfs_target_grid: '{{ val.filenames.gfs_target_grid }}'
+    hrrr_target_grid: '{{ val.filenames.hrrr_target_grid }}'
+  rundir: '{{ val.data.rundir }}'
+inference:
+  anemoi:
+    checkpoint_path: /path/to/checkpoint
+    lead_time: !int '{{ app.leadtime }}'
+    input_dataset_kwargs:
+      cutout:
+        - dataset: '{{ grids_and_meshes.rundir }}/hrrr.zarr'
+          trim_edge: [10, 11, 10, 11]
+        - dataset: '{{ grids_and_meshes.rundir }}/gfs.zarr'
+      adjust: all
+      min_distance_km: 0
+    output_path: '{{ inference.rundir }}/output'
+    start_date: '{{ (app.time.start + app.time.step).strftime("%Y-%m-%dT%H") }}'
+    end_date: '{{ inference.anemoi.start_date }}'
+    freq: '{{ (app.time.step.total_seconds() / 3600) | int }}h'
+  checkpoint_dir: '{{ training.rundir }}/outputs/checkpoint'
+  execution:
+    batchargs: 
+      <<: *gpu-batchargs
+      memory: 64G
+      rundir: '{{ inference.rundir }}'
+      walltime: '00:10:00'
+    envcmds:
+      - source {{ val.conda }}/etc/profile.d/conda.sh
+      - conda activate anemoi
+      - set -ex
+      - export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+    executable: eagle-tools inference inference.yaml
+  rundir: '{{ app.rundir }}/inference'
+platform: *platform
+ufs2arco:
+  # Global ufs2arco defaults, referenced from and refined in the zarrs.{gfs,hrrr} blocks.
+  dirs:
+    cache: cache/X
+    logs: logs/X
+    zarr: X.zarr
+  mover:
+    name: datamover
+    batch_size: 1
+  regridder:
+    method: conservative
+    reuse_weights: True
+  slices:
+    sel:
+      latitude: [89.9, -89.9]
+  source:
+    fhr:
+      start: 0
+      step: !int '{{ val.step }}'
+      end: 0
+    levels: !list '{{ val.levels }}'
+    t0:
+      start: '{{ (app.time.start + app.time.step).strftime("%Y-%m-%dT%H") }}'
+      freq: '{{ val.step }}h'
+      end: '{{ (app.time.stop + app.time.step).strftime("%Y-%m-%dT%H") }}'
+    variables: !list '{{ val.variables }}'
+  target:
+    chunks:
+      cell: -1
+      ensemble: 1
+      time: 1
+      variable: -1
+    forcings:
+      - cos_latitude
+      - sin_latitude
+      - cos_longitude
+      - sin_longitude
+      - cos_julian_day
+      - sin_julian_day
+      - cos_local_time
+      - sin_local_time
+      - insolation
+    name: anemoi_inference_with_forcings
+    sort_channels_by_levels: True
+    save_additional_step: True
+val:
+  # Computed or static values referenced elsewhere in the config.
+  conda: '{{ app.base }}/conda'
+  data:
+    rundir: '{{ app.rundir }}/data'
+  filenames:
+    combined_grids: latentx2.spongex1.combined.sorted.npz
+    gfs_target_grid: global_one_degree.nc
+    hrrr_target_grid: hrrr_15km.nc
+  levels: [100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  step: !int '{{ (app.time.step.total_seconds() / 3600) | int }}'
+  variables:
+    # 3D Prognostic
+    - gh
+    - u
+    - v
+    - w
+    - t
+    - q
+    # 2D Prognostic
+    - sp
+    - u10
+    - v10
+    - t2m
+    - t_surface
+    - sh2
+    # Diagnostic
+    - u80
+    - v80
+    # Forcing
+    - lsm
+    - orog
+zarrs:
+  # Configs for the Zarr driver.
+  common:
+    # Shared config for the gfs and hrrr configurations.
+    execution: &zarrs-common-execution
+      batchargs:
+        cores: 15
+        memory: 128G
+        partition: '{{ app.partitions.netaccess }}'
+        rundir: '{{ val.data.rundir }}'
+        walltime: '00:30:00'
+      envcmds:
+        - source {{ val.conda }}/etc/profile.d/conda.sh
+        - conda activate data
+        - set -ex
+      executable: ufs2arco ufs2arco-gfs.yaml --overwrite
+      mpicmd: '{{ "srun" if app.platform.scheduler == "slurm" else "mpiexec" }}'
+  gfs:
+    zarr:
+      # Config for the Zarr driver parameterized for GFS.
+      execution:
+        <<: *zarrs-common-execution
+        executable: ufs2arco ufs2arco-gfs.yaml --overwrite
+      name: gfs
+      ufs2arco:
+        directories: !dict '{{ ufs2arco.dirs | replace("X", "gfs") }}'
+        mover: !dict '{{ ufs2arco.mover }}'
+        source: !dict '{{ dict(ufs2arco.source.analysis, name="gfs_archive") }}'
+        target: !dict '{{ ufs2arco.target }}'
+        transforms:
+          horizontal_regrid:
+            regridder_kwargs: !dict '{{ dict(ufs2arco.regridder, filename="conservative_719x1440_180x360.nc") }}'
+            target_grid_path: '{{ val.data.rundir}}/{{ val.filenames.gfs_target_grid }}'
+      rundir: '{{ val.data.rundir }}'
+    platform: *platform
+  hrrr:
+    zarr:
+      # Config for the Zarr driver parameterized for HRRR.
+      execution:
+        <<: *zarrs-common-execution
+        executable: ufs2arco ufs2arco-hrrr.yaml --overwrite
+      name: hrrr
+      ufs2arco:
+        directories: !dict '{{ ufs2arco.dirs | replace("X", "hrrr") }}'
+        mover: !dict '{{ ufs2arco.mover }}'
+        source: !dict '{{
+          dict(
+            ufs2arco.source,
+            name="aws_hrrr_archive",
+            transforms={
+              "rotate_vectors": {
+                "vector_pairs": [
+                  ["u", "v"],
+                  ["u10", "v10"],
+                  ["u80", "v80"],
+                ]
+              }
+            }
+          )
+        }}'
+        target: !dict '{{ ufs2arco.target }}'
+        transforms:
+          horizontal_regrid:
+            regridder_kwargs: !dict '{{ dict(ufs2arco.regridder, filename="conservative_1059x1799_211x359.nc") }}'
+            target_grid_path: '{{ val.data.rundir }}/{{ val.filenames.hrrr_target_grid }}'
+      rundir: '{{ val.data.rundir }}'
+    platform: *platform
